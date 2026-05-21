@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+*.egg-info/
 .pytest_cache/
 .venv/
 .env
@@ -10,3 +11,5 @@ data/
 *.ckpt
 wandb/
 .DS_Store
+adaptive_lora_drs_projection_repo_files/
+adaptive_lora_drs_projection_repo_files.zip

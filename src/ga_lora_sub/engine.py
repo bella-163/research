@@ -9,6 +9,7 @@ from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
 from .models.lora import LoRALinear, iter_lora_modules
+from .drs import project_lora_a_gradients, project_lora_a_weights
 
 
 def _make_local_targets(targets: torch.Tensor, current_classes: Sequence[int]) -> torch.Tensor:
@@ -27,6 +28,8 @@ def train_one_task(
     device: torch.device,
     epochs: int,
     amp: bool = False,
+    drs_projectors: Optional[Dict[str, torch.Tensor]] = None,
+    project_after_step: bool = True,
 ) -> Dict[str, float]:
     scaler = GradScaler(enabled=amp)
     model.train()
@@ -46,8 +49,14 @@ def train_one_task(
                 logits_cur = logits[:, list(current_classes)]
                 loss = F.cross_entropy(logits_cur, local_targets)
             scaler.scale(loss).backward()
+            if drs_projectors:
+                # DRS constrains LoRA input-side updates. Projection is linear,
+                # so it is safe even when AMP gradients are still scaled.
+                project_lora_a_gradients(model, drs_projectors)
             scaler.step(optimizer)
             scaler.update()
+            if drs_projectors and project_after_step:
+                project_lora_a_weights(model, drs_projectors)
 
             bs = images.size(0)
             running_loss += float(loss.detach().cpu()) * bs

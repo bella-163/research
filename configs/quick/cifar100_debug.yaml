@@ -37,6 +37,12 @@ method:
   gamma_min: 0.5
   gamma_max: 1.5
   grad_batches: 1
+  drs_batches: 4
+  drs_energy: 0.95
+  drs_rank: null
+  drs_max_rank: 32
+  drs_max_rows_per_batch: 2048
+  drs_project_after_step: true
 
 evaluation:
   classifier: ncm

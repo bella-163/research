@@ -19,6 +19,7 @@ from .engine import (
     train_one_task,
     update_prototypes,
 )
+from .drs import build_drs_projectors, drs_diagnostics_to_dict
 from .methods import compute_gammas
 from .metrics import summarize_stage
 from .models.lora import (
@@ -29,7 +30,6 @@ from .models.lora import (
     empty_lora_deltas,
     freeze_non_lora,
     reset_lora_parameters,
-    scale_delta_dict,
     set_subtraction_deltas,
 )
 from .models.timm_backbone import build_model
@@ -94,8 +94,10 @@ def main() -> None:
         print(f"\n[task {task_idx + 1}/{len(tasks)}] raw_classes={task.raw_classes}")
         reset_lora_parameters(model)
         clear_subtraction_deltas(model)
+        # Start each task from the accumulated model W0 + old_delta.
+        set_subtraction_deltas(model, old_deltas, sign=1.0)
 
-        # Estimate gamma with no subtraction first.
+        # Estimate adaptive gamma on the actual current model state.
         alignments = estimate_gradient_alignment(
             model,
             train_loaders[task_idx],
@@ -105,11 +107,37 @@ def main() -> None:
             max_batches=int(cfg["method"].get("grad_batches", 1)),
         )
         gammas = compute_gammas(cfg["method"], alignments, old_deltas)
-        save_json({"alignments": alignments, "gammas": gammas}, work_dir / f"gammas_task_{task_idx + 1}.json")
 
-        # Train in drift-resistant space: W0 - gamma * old_delta + current LoRA.
-        subtraction = scale_delta_dict(old_deltas, gammas)
-        set_subtraction_deltas(model, subtraction, sign=-1.0)
+        # Build DRS from the subtracted model W0 - gamma * old_delta,
+        # then train on the accumulated model W0 + old_delta + current LoRA.
+        # This follows the original LoRA-Subtraction idea: subtraction is used
+        # to construct the projection space, not as the actual training/eval path.
+        drs_projectors = None
+        drs_diag = {}
+        use_drs = task_idx > 0 and any(abs(float(v)) > 0 for v in gammas.values())
+        if use_drs:
+            drs_projectors, diag = build_drs_projectors(
+                model,
+                train_loaders[task_idx],
+                old_deltas=old_deltas,
+                gammas=gammas,
+                device=device,
+                max_batches=int(cfg["method"].get("drs_batches", cfg["method"].get("grad_batches", 4))),
+                max_rows_per_batch=int(cfg["method"].get("drs_max_rows_per_batch", 4096)),
+                rank=cfg["method"].get("drs_rank"),
+                energy=cfg["method"].get("drs_energy", 0.95),
+                max_rank=cfg["method"].get("drs_max_rank"),
+            )
+            drs_diag = drs_diagnostics_to_dict(diag)
+            save_json(
+                {"alignments": alignments, "gammas": gammas, "drs": drs_diag},
+                work_dir / f"gammas_task_{task_idx + 1}.json",
+            )
+        else:
+            save_json({"alignments": alignments, "gammas": gammas, "drs": drs_diag}, work_dir / f"gammas_task_{task_idx + 1}.json")
+
+        # Actual training path: keep old accumulated LoRA active and learn current LoRA.
+        set_subtraction_deltas(model, old_deltas, sign=1.0)
 
         optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
@@ -124,6 +152,8 @@ def main() -> None:
             device=device,
             epochs=epochs,
             amp=amp,
+            drs_projectors=drs_projectors,
+            project_after_step=bool(cfg["method"].get("drs_project_after_step", True)),
         )
 
         # Merge current LoRA into cumulative delta bank, then evaluate with W0 + cumulative LoRA.
