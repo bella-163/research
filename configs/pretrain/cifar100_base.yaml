@@ -1,0 +1,24 @@
+seed: 42
+
+data:
+  dataset: cifar100
+  root: ./data
+  image_size: 224
+  download: true
+  class_order: range
+  class_range: [0, 50]
+  max_train_per_class: null
+  max_test_per_class: null
+  num_workers: 4
+
+model:
+  name: vit_tiny_patch16_224
+  pretrained: false
+  allow_random_fallback: true
+
+training:
+  epochs: 50
+  batch_size: 64
+  lr: 0.001
+  weight_decay: 0.05
+  amp: true

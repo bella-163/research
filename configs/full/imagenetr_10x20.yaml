@@ -1,0 +1,44 @@
+seed: 42
+
+data:
+  dataset: imagefolder
+  train_dir: ./data/imagenet-r/train
+  val_dir: ./data/imagenet-r/val
+  image_size: 224
+  class_order: seeded
+  class_order_seed: 1993
+  num_tasks: 10
+  classes_per_task: 20
+  max_train_per_class: null
+  max_test_per_class: null
+  num_workers: 8
+
+model:
+  name: vit_base_patch16_224
+  pretrained: true
+  allow_random_fallback: false
+  checkpoint: null
+  lora:
+    rank: 8
+    alpha: 16
+    dropout: 0.05
+    target_modules: ["attn.qkv"]
+
+training:
+  epochs: 10
+  batch_size: 64
+  lr: 0.0005
+  weight_decay: 0.0001
+  train_head: true
+  amp: true
+
+method:
+  name: adaptive
+  rho: 0.5
+  gamma_min: 0.5
+  gamma_max: 1.5
+  grad_batches: 3
+
+evaluation:
+  classifier: ncm
+  save_features_for_drift: true

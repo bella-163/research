@@ -1,0 +1,1938 @@
+diff --git a/.github/workflows/smoke.yml b/.github/workflows/smoke.yml
+new file mode 100644
+index 0000000..a79fff9
+--- /dev/null
++++ b/.github/workflows/smoke.yml
+@@ -0,0 +1,22 @@
++name: smoke-test
++
++on:
++  workflow_dispatch:
++  push:
++    branches: [main]
++
++jobs:
++  smoke:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - uses: actions/setup-python@v5
++        with:
++          python-version: '3.10'
++      - name: Install
++        run: |
++          python -m pip install -U pip
++          pip install -r requirements.txt
++          pip install -e .
++      - name: Unit test LoRA wrapper
++        run: pytest -q tests || true
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..878cbc3
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,11 @@
++__pycache__/
++*.pyc
++.venv/
++.env
++outputs/
++data/
++*.pt
++*.pth
++*.ckpt
++wandb/
++.DS_Store
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..adf68cb
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,145 @@
++# Adaptive LoRA Subtraction for Class-Incremental Learning
++
++這個 repo 是用來跑 **Gradient-Aware Adaptive LoRA Subtraction** 的快速實驗與完整實驗。
++研究目標是：在 rehearsal-free Class-Incremental Learning 中，透過 LoRA Subtraction 建立較穩定的 Drift-Resistant Space，並進一步用 gradient alignment 自動調整每一層的 subtraction strength，降低舊類別 feature drift。
++
++## 方法摘要
++
++對第 `t` 個 task，第 `l` 層舊任務累積 LoRA 更新為：
++
++```text
++V_old^l = sum_{j=1}^{t-1} ΔW_j^l
++```
++
++固定版 LoRA Subtraction：
++
++```text
++W_tilde^l = W_0^l - V_old^l
++```
++
++本專案實作的 Adaptive LoRA Subtraction：
++
++```text
++s_t^l = cos(-grad_t^l, V_old^l)
++gamma_t^l = clip(1 - rho * s_t^l, gamma_min, gamma_max)
++W_tilde^l = W_0^l - gamma_t^l * V_old^l
++```
++
++直覺：
++
++- 新任務更新方向與舊 LoRA 相似：少扣一點，保留可轉移知識。
++- 新任務更新方向與舊 LoRA 衝突：多扣一點，減少干擾。
++- 不確定：接近固定 subtraction。
++
++## 安裝
++
++```bash
++git clone https://github.com/bella-163/research.git
++cd research
++python -m venv .venv
++source .venv/bin/activate
++pip install -U pip
++pip install -r requirements.txt
++pip install -e .
++```
++
++## 快速實驗
++
++快速實驗使用 CIFAR-100 的少量類別與少量樣本，適合檢查程式能不能跑通。
++
++```bash
++bash scripts/run_quick.sh
++```
++
++預設會跑三個方法：
++
++```text
++none      : 不做 LoRA Subtraction
++fixed     : 固定 gamma = 1 的 LoRA Subtraction
++adaptive  : gradient-aware adaptive LoRA Subtraction
++```
++
++結果會輸出到：
++
++```text
++outputs/quick/
++```
++
++## 完整實驗：CIFAR-100 10 tasks x 10 classes
++
++```bash
++bash scripts/run_full_cifar100.sh
++```
++
++結果會輸出到：
++
++```text
++outputs/full_cifar100/
++```
++
++## Pre-trained model 還沒訓練怎麼辦？
++
++有兩種路線：
++
++### 路線 A：使用 timm 已提供的 ImageNet pre-trained ViT
++
++這是最快、最接近 PTM-based CIL 論文設定的方式。設定檔中：
++
++```yaml
++model:
++  pretrained: true
++```
++
++第一次跑時會自動下載 timm 權重。若環境沒有網路，可以先在有網路的環境下載或改用路線 B。
++
++### 路線 B：自己先做 supervised pretraining
++
++下面指令會用 CIFAR-100 的前 50 類訓練一個 backbone checkpoint，再用剩下類別做 CIL。這不是大型 PTM，但適合在沒有現成 pre-trained weights 時做完整 pipeline 驗證。
++
++```bash
++bash scripts/run_pretrain_cifar100.sh
++```
++
++pretrain checkpoint 預設輸出：
++
++```text
++outputs/pretrain_cifar100_base/backbone.pt
++```
++
++接著跑 self-pretrain 後的 CIL：
++
++```bash
++python -m ga_lora_sub.train_cil \
++  --config configs/full/cifar100_pretrain50_cil50.yaml \
++  --work-dir outputs/full_cifar100_pretrain50_cil50 \
++  --set model.checkpoint=outputs/pretrain_cifar100_base/backbone.pt
++```
++
++## 重要輸出
++
++每個實驗資料夾會包含：
++
++```text
++config_resolved.yaml          # 實際使用設定
++metrics.csv                   # 每個 stage 的 accuracy / forgetting / drift
++accuracy_matrix.npy           # acc_matrix[train_stage, eval_task]
++gammas_task_*.json            # adaptive subtraction 的每層 gamma
++checkpoint_last.pt            # 最後模型與 LoRA 狀態
++```
++
++## 建議的實驗順序
++
++1. 先跑 `bash scripts/run_quick.sh` 確認環境與程式正常。
++2. 再跑 `bash scripts/run_full_cifar100.sh` 建立主要表格。
++3. 若沒有 ImageNet pre-trained 權重，先跑 `bash scripts/run_pretrain_cifar100.sh`。
++4. 最後比較 `none / fixed / adaptive` 的：
++   - Average Accuracy
++   - Final Accuracy
++   - Forgetting
++   - Feature Drift Distance
++
++## 注意事項
++
++- 本專案預設是 rehearsal-free：訓練每個 task 時不使用舊 task 的訓練資料。
++- Feature drift metric 只用於分析與報告，不會回傳到訓練 loss。
++- 若要嚴格遵守 benchmark，pretraining dataset 應避免與 downstream CIL 類別重疊。
+diff --git a/configs/full/cifar100_10x10.yaml b/configs/full/cifar100_10x10.yaml
+new file mode 100644
+index 0000000..3f1665c
+--- /dev/null
++++ b/configs/full/cifar100_10x10.yaml
+@@ -0,0 +1,44 @@
++seed: 42
++
++data:
++  dataset: cifar100
++  root: ./data
++  image_size: 224
++  download: true
++  class_order: seeded
++  class_order_seed: 1993
++  num_tasks: 10
++  classes_per_task: 10
++  max_train_per_class: null
++  max_test_per_class: null
++  num_workers: 4
++
++model:
++  name: vit_base_patch16_224
++  pretrained: true
++  allow_random_fallback: false
++  checkpoint: null
++  lora:
++    rank: 8
++    alpha: 16
++    dropout: 0.05
++    target_modules: ["attn.qkv"]
++
++training:
++  epochs: 10
++  batch_size: 64
++  lr: 0.0005
++  weight_decay: 0.0001
++  train_head: true
++  amp: true
++
++method:
++  name: adaptive
++  rho: 0.5
++  gamma_min: 0.5
++  gamma_max: 1.5
++  grad_batches: 3
++
++evaluation:
++  classifier: ncm
++  save_features_for_drift: true
+diff --git a/configs/full/cifar100_20x5.yaml b/configs/full/cifar100_20x5.yaml
+new file mode 100644
+index 0000000..4854aee
+--- /dev/null
++++ b/configs/full/cifar100_20x5.yaml
+@@ -0,0 +1,44 @@
++seed: 42
++
++data:
++  dataset: cifar100
++  root: ./data
++  image_size: 224
++  download: true
++  class_order: seeded
++  class_order_seed: 1993
++  num_tasks: 20
++  classes_per_task: 5
++  max_train_per_class: null
++  max_test_per_class: null
++  num_workers: 4
++
++model:
++  name: vit_base_patch16_224
++  pretrained: true
++  allow_random_fallback: false
++  checkpoint: null
++  lora:
++    rank: 8
++    alpha: 16
++    dropout: 0.05
++    target_modules: ["attn.qkv"]
++
++training:
++  epochs: 8
++  batch_size: 64
++  lr: 0.0005
++  weight_decay: 0.0001
++  train_head: true
++  amp: true
++
++method:
++  name: adaptive
++  rho: 0.5
++  gamma_min: 0.5
++  gamma_max: 1.5
++  grad_batches: 3
++
++evaluation:
++  classifier: ncm
++  save_features_for_drift: true
+diff --git a/configs/full/cifar100_pretrain50_cil50.yaml b/configs/full/cifar100_pretrain50_cil50.yaml
+new file mode 100644
+index 0000000..1ccaa43
+--- /dev/null
++++ b/configs/full/cifar100_pretrain50_cil50.yaml
+@@ -0,0 +1,44 @@
++seed: 42
++
++data:
++  dataset: cifar100
++  root: ./data
++  image_size: 224
++  download: true
++  class_order: range
++  class_range: [50, 100]
++  num_tasks: 5
++  classes_per_task: 10
++  max_train_per_class: null
++  max_test_per_class: null
++  num_workers: 4
++
++model:
++  name: vit_tiny_patch16_224
++  pretrained: false
++  allow_random_fallback: true
++  checkpoint: outputs/pretrain_cifar100_base/backbone.pt
++  lora:
++    rank: 8
++    alpha: 16
++    dropout: 0.05
++    target_modules: ["attn.qkv"]
++
++training:
++  epochs: 10
++  batch_size: 64
++  lr: 0.0005
++  weight_decay: 0.0001
++  train_head: true
++  amp: true
++
++method:
++  name: adaptive
++  rho: 0.5
++  gamma_min: 0.5
++  gamma_max: 1.5
++  grad_batches: 3
++
++evaluation:
++  classifier: ncm
++  save_features_for_drift: true
+diff --git a/configs/full/imagenetr_10x20.yaml b/configs/full/imagenetr_10x20.yaml
+new file mode 100644
+index 0000000..6af8962
+--- /dev/null
++++ b/configs/full/imagenetr_10x20.yaml
+@@ -0,0 +1,44 @@
++seed: 42
++
++data:
++  dataset: imagefolder
++  train_dir: ./data/imagenet-r/train
++  val_dir: ./data/imagenet-r/val
++  image_size: 224
++  class_order: seeded
++  class_order_seed: 1993
++  num_tasks: 10
++  classes_per_task: 20
++  max_train_per_class: null
++  max_test_per_class: null
++  num_workers: 8
++
++model:
++  name: vit_base_patch16_224
++  pretrained: true
++  allow_random_fallback: false
++  checkpoint: null
++  lora:
++    rank: 8
++    alpha: 16
++    dropout: 0.05
++    target_modules: ["attn.qkv"]
++
++training:
++  epochs: 10
++  batch_size: 64
++  lr: 0.0005
++  weight_decay: 0.0001
++  train_head: true
++  amp: true
++
++method:
++  name: adaptive
++  rho: 0.5
++  gamma_min: 0.5
++  gamma_max: 1.5
++  grad_batches: 3
++
++evaluation:
++  classifier: ncm
++  save_features_for_drift: true
+diff --git a/configs/pretrain/cifar100_base.yaml b/configs/pretrain/cifar100_base.yaml
+new file mode 100644
+index 0000000..0441093
+--- /dev/null
++++ b/configs/pretrain/cifar100_base.yaml
+@@ -0,0 +1,24 @@
++seed: 42
++
++data:
++  dataset: cifar100
++  root: ./data
++  image_size: 224
++  download: true
++  class_order: range
++  class_range: [0, 50]
++  max_train_per_class: null
++  max_test_per_class: null
++  num_workers: 4
++
++model:
++  name: vit_tiny_patch16_224
++  pretrained: false
++  allow_random_fallback: true
++
++training:
++  epochs: 50
++  batch_size: 64
++  lr: 0.001
++  weight_decay: 0.05
++  amp: true
+diff --git a/configs/quick/cifar100_debug.yaml b/configs/quick/cifar100_debug.yaml
+new file mode 100644
+index 0000000..07eb999
+--- /dev/null
++++ b/configs/quick/cifar100_debug.yaml
+@@ -0,0 +1,43 @@
++seed: 42
++
++data:
++  dataset: cifar100
++  root: ./data
++  image_size: 224
++  download: true
++  class_order: sequential
++  num_tasks: 5
++  classes_per_task: 2
++  max_train_per_class: 20
++  max_test_per_class: 20
++  num_workers: 2
++
++model:
++  name: vit_tiny_patch16_224
++  pretrained: true
++  allow_random_fallback: true
++  checkpoint: null
++  lora:
++    rank: 4
++    alpha: 8
++    dropout: 0.0
++    target_modules: ["attn.qkv"]
++
++training:
++  epochs: 1
++  batch_size: 16
++  lr: 0.001
++  weight_decay: 0.0001
++  train_head: true
++  amp: false
++
++method:
++  name: adaptive
++  rho: 0.5
++  gamma_min: 0.5
++  gamma_max: 1.5
++  grad_batches: 1
++
++evaluation:
++  classifier: ncm
++  save_features_for_drift: true
+diff --git a/docs/EXPERIMENTS.md b/docs/EXPERIMENTS.md
+new file mode 100644
+index 0000000..d370330
+--- /dev/null
++++ b/docs/EXPERIMENTS.md
+@@ -0,0 +1,32 @@
++# 實驗規劃
++
++## Baselines
++
++| 名稱 | 說明 |
++|---|---|
++| none | 不做 LoRA Subtraction，直接在新 task 上訓練 LoRA |
++| fixed | 固定 gamma=1，對舊 LoRA 做 subtraction |
++| adaptive | 使用 gradient alignment 動態估計每層 gamma |
++
++## Metrics
++
++| 指標 | 說明 |
++|---|---|
++| Average Accuracy | 每個 stage 對所有已見 task 的平均準確率 |
++| Final Accuracy | 最後 stage 的平均準確率 |
++| Forgetting | 舊 task 歷史最佳準確率與目前準確率的差距 |
++| Feature Drift | 舊 task feature centroid 在模型更新前後的距離 |
++| Trainable Params | LoRA 與 classifier 的可訓練參數量 |
++
++## 建議表格
++
++1. CIFAR-100 10 tasks x 10 classes：主表。
++2. CIFAR-100 20 tasks x 5 classes：長序列穩定性。
++3. self-pretrain 50 classes -> CIL 50 classes：沒有外部 PTM 時的完整 pipeline。
++
++## 建議 ablation
++
++- gamma 固定值：0, 0.5, 1.0, 1.5
++- adaptive 的 rho：0.25, 0.5, 1.0
++- LoRA rank：2, 4, 8
++- LoRA target module：qkv, qkv+proj, qkv+proj+mlp
+diff --git a/pyproject.toml b/pyproject.toml
+new file mode 100644
+index 0000000..3e71335
+--- /dev/null
++++ b/pyproject.toml
+@@ -0,0 +1,12 @@
++[build-system]
++requires = ["setuptools>=68", "wheel"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "ga-lora-sub"
++version = "0.1.0"
++description = "Gradient-aware adaptive LoRA subtraction for rehearsal-free class-incremental learning"
++requires-python = ">=3.9"
++
++[tool.setuptools.packages.find]
++where = ["src"]
+diff --git a/requirements.txt b/requirements.txt
+new file mode 100644
+index 0000000..88aabc9
+--- /dev/null
++++ b/requirements.txt
+@@ -0,0 +1,8 @@
++torch>=2.1
++torchvision>=0.16
++timm>=0.9.12
++PyYAML>=6.0
++tqdm>=4.66
++numpy>=1.24
++pandas>=2.0
++matplotlib>=3.7
+diff --git a/scripts/make_subset_imagenetr.py b/scripts/make_subset_imagenetr.py
+new file mode 100644
+index 0000000..c760be4
+--- /dev/null
++++ b/scripts/make_subset_imagenetr.py
+@@ -0,0 +1,50 @@
++"""Utility for creating train/val folders from an ImageFolder-style dataset.
++
++Usage:
++  python scripts/make_subset_imagenetr.py --src data/imagenet-r/raw --dst data/imagenet-r --val-ratio 0.2
++
++The source folder should be organized as:
++  raw/class_name/*.jpg
++
++The output will be:
++  dst/train/class_name/*.jpg
++  dst/val/class_name/*.jpg
++"""
++from __future__ import annotations
++
++import argparse
++import random
++import shutil
++from pathlib import Path
++
++
++def parse_args():
++    p = argparse.ArgumentParser()
++    p.add_argument("--src", required=True)
++    p.add_argument("--dst", required=True)
++    p.add_argument("--val-ratio", type=float, default=0.2)
++    p.add_argument("--seed", type=int, default=42)
++    return p.parse_args()
++
++
++def main():
++    args = parse_args()
++    src = Path(args.src)
++    dst = Path(args.dst)
++    rng = random.Random(args.seed)
++    classes = [p for p in src.iterdir() if p.is_dir()]
++    for cls in classes:
++        files = [p for p in cls.rglob("*") if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}]
++        rng.shuffle(files)
++        n_val = int(len(files) * args.val_ratio)
++        split = {"val": files[:n_val], "train": files[n_val:]}
++        for split_name, split_files in split.items():
++            out_dir = dst / split_name / cls.name
++            out_dir.mkdir(parents=True, exist_ok=True)
++            for f in split_files:
++                shutil.copy2(f, out_dir / f.name)
++    print(f"Created split at {dst}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/run_full_cifar100.sh b/scripts/run_full_cifar100.sh
+new file mode 100755
+index 0000000..fd1e01a
+--- /dev/null
++++ b/scripts/run_full_cifar100.sh
+@@ -0,0 +1,28 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++CONFIG=configs/full/cifar100_10x10.yaml
++OUT=outputs/full_cifar100
++
++for METHOD in none fixed adaptive; do
++  echo "========== full CIFAR-100 experiment: ${METHOD} =========="
++  python -m ga_lora_sub.train_cil \
++    --config ${CONFIG} \
++    --work-dir ${OUT}/${METHOD} \
++    --set method.name=${METHOD}
++done
++
++python - <<'PY'
++from pathlib import Path
++import pandas as pd
++rows=[]
++for p in Path('outputs/full_cifar100').glob('*/metrics.csv'):
++    df=pd.read_csv(p)
++    last=df.tail(1).copy()
++    last.insert(0,'run',p.parent.name)
++    rows.append(last)
++if rows:
++    out=pd.concat(rows,ignore_index=True)
++    print(out.to_string(index=False))
++    out.to_csv('outputs/full_cifar100/summary.csv',index=False)
++PY
+diff --git a/scripts/run_pretrain_cifar100.sh b/scripts/run_pretrain_cifar100.sh
+new file mode 100755
+index 0000000..e718c61
+--- /dev/null
++++ b/scripts/run_pretrain_cifar100.sh
+@@ -0,0 +1,6 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++python -m ga_lora_sub.pretrain \
++  --config configs/pretrain/cifar100_base.yaml \
++  --work-dir outputs/pretrain_cifar100_base
+diff --git a/scripts/run_quick.sh b/scripts/run_quick.sh
+new file mode 100755
+index 0000000..3c7ebde
+--- /dev/null
++++ b/scripts/run_quick.sh
+@@ -0,0 +1,28 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++CONFIG=configs/quick/cifar100_debug.yaml
++OUT=outputs/quick
++
++for METHOD in none fixed adaptive; do
++  echo "========== quick experiment: ${METHOD} =========="
++  python -m ga_lora_sub.train_cil \
++    --config ${CONFIG} \
++    --work-dir ${OUT}/${METHOD} \
++    --set method.name=${METHOD}
++done
++
++python - <<'PY'
++from pathlib import Path
++import pandas as pd
++rows=[]
++for p in Path('outputs/quick').glob('*/metrics.csv'):
++    df=pd.read_csv(p)
++    last=df.tail(1).copy()
++    last.insert(0,'run',p.parent.name)
++    rows.append(last)
++if rows:
++    out=pd.concat(rows,ignore_index=True)
++    print(out.to_string(index=False))
++    out.to_csv('outputs/quick/summary.csv',index=False)
++PY
+diff --git a/scripts/run_self_pretrain_cil.sh b/scripts/run_self_pretrain_cil.sh
+new file mode 100755
+index 0000000..854a30f
+--- /dev/null
++++ b/scripts/run_self_pretrain_cil.sh
+@@ -0,0 +1,14 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++if [ ! -f outputs/pretrain_cifar100_base/backbone.pt ]; then
++  echo "Pretrain checkpoint not found. Running pretraining first."
++  bash scripts/run_pretrain_cifar100.sh
++fi
++
++for METHOD in none fixed adaptive; do
++  python -m ga_lora_sub.train_cil \
++    --config configs/full/cifar100_pretrain50_cil50.yaml \
++    --work-dir outputs/full_cifar100_pretrain50_cil50/${METHOD} \
++    --set method.name=${METHOD} model.checkpoint=outputs/pretrain_cifar100_base/backbone.pt
++done
+diff --git a/src/ga_lora_sub/__init__.py b/src/ga_lora_sub/__init__.py
+new file mode 100644
+index 0000000..3dc1f76
+--- /dev/null
++++ b/src/ga_lora_sub/__init__.py
+@@ -0,0 +1 @@
++__version__ = "0.1.0"
+diff --git a/src/ga_lora_sub/data.py b/src/ga_lora_sub/data.py
+new file mode 100644
+index 0000000..f71e04c
+--- /dev/null
++++ b/src/ga_lora_sub/data.py
+@@ -0,0 +1,200 @@
++from __future__ import annotations
++
++import random
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Dict, List, Optional, Sequence, Tuple
++
++import numpy as np
++import torch
++from torch.utils.data import DataLoader, Dataset, Subset
++from torchvision import datasets, transforms
++
++
++@dataclass
++class TaskData:
++    task_id: int
++    raw_classes: List[int]
++    global_classes: List[int]
++    train_set: Dataset
++    test_set: Dataset
++
++
++class RemapClassSubset(Dataset):
++    """Subset dataset by raw labels and remap them to global CIL label indices."""
++
++    def __init__(
++        self,
++        base: Dataset,
++        raw_classes: Sequence[int],
++        raw_to_global: Dict[int, int],
++        max_per_class: Optional[int] = None,
++        seed: int = 0,
++    ) -> None:
++        self.base = base
++        self.raw_classes = list(raw_classes)
++        self.raw_to_global = raw_to_global
++        self.indices = self._select_indices(max_per_class=max_per_class, seed=seed)
++
++    def _targets(self) -> List[int]:
++        if hasattr(self.base, "targets"):
++            return list(getattr(self.base, "targets"))
++        if hasattr(self.base, "samples"):
++            return [y for _, y in getattr(self.base, "samples")]
++        raise AttributeError("Dataset must expose `targets` or `samples`.")
++
++    def _select_indices(self, max_per_class: Optional[int], seed: int) -> List[int]:
++        targets = self._targets()
++        buckets: Dict[int, List[int]] = {c: [] for c in self.raw_classes}
++        raw_set = set(self.raw_classes)
++        for idx, y in enumerate(targets):
++            if y in raw_set:
++                buckets[y].append(idx)
++        rng = random.Random(seed)
++        selected: List[int] = []
++        for c in self.raw_classes:
++            inds = buckets[c]
++            rng.shuffle(inds)
++            if max_per_class is not None:
++                inds = inds[: int(max_per_class)]
++            selected.extend(inds)
++        rng.shuffle(selected)
++        return selected
++
++    def __len__(self) -> int:
++        return len(self.indices)
++
++    def __getitem__(self, idx: int):
++        x, y = self.base[self.indices[idx]]
++        return x, self.raw_to_global[int(y)]
++
++
++def build_transforms(image_size: int, train: bool):
++    if train:
++        return transforms.Compose(
++            [
++                transforms.Resize((image_size, image_size)),
++                transforms.RandomHorizontalFlip(),
++                transforms.ToTensor(),
++                transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
++            ]
++        )
++    return transforms.Compose(
++        [
++            transforms.Resize((image_size, image_size)),
++            transforms.ToTensor(),
++            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
++        ]
++    )
++
++
++def _load_base_datasets(cfg: dict):
++    name = cfg["dataset"].lower()
++    image_size = int(cfg.get("image_size", 224))
++    if name == "cifar100":
++        root = cfg.get("root", "./data")
++        download = bool(cfg.get("download", True))
++        train = datasets.CIFAR100(root=root, train=True, download=download, transform=build_transforms(image_size, True))
++        test = datasets.CIFAR100(root=root, train=False, download=download, transform=build_transforms(image_size, False))
++        return train, test, 100
++    if name == "cifar10":
++        root = cfg.get("root", "./data")
++        download = bool(cfg.get("download", True))
++        train = datasets.CIFAR10(root=root, train=True, download=download, transform=build_transforms(image_size, True))
++        test = datasets.CIFAR10(root=root, train=False, download=download, transform=build_transforms(image_size, False))
++        return train, test, 10
++    if name == "imagefolder":
++        train_dir = cfg.get("train_dir")
++        val_dir = cfg.get("val_dir")
++        if train_dir is None or val_dir is None:
++            raise ValueError("imagefolder dataset requires data.train_dir and data.val_dir")
++        train = datasets.ImageFolder(train_dir, transform=build_transforms(image_size, True))
++        test = datasets.ImageFolder(val_dir, transform=build_transforms(image_size, False))
++        if train.class_to_idx != test.class_to_idx:
++            raise ValueError("train_dir and val_dir must share the same class_to_idx mapping")
++        return train, test, len(train.classes)
++    raise ValueError(f"Unsupported dataset: {name}")
++
++
++def resolve_class_order(cfg: dict, num_classes: int, seed: int) -> List[int]:
++    mode = cfg.get("class_order", "sequential")
++    if isinstance(mode, list):
++        return [int(x) for x in mode]
++    if mode == "sequential":
++        return list(range(num_classes))
++    if mode == "seeded":
++        rng = np.random.default_rng(int(cfg.get("class_order_seed", seed)))
++        order = np.arange(num_classes)
++        rng.shuffle(order)
++        return [int(x) for x in order]
++    if mode == "range":
++        start, end = cfg.get("class_range", [0, num_classes])
++        return list(range(int(start), int(end)))
++    raise ValueError(f"Unsupported class_order: {mode}")
++
++
++def build_cil_tasks(cfg: dict, seed: int) -> Tuple[List[TaskData], List[int], int]:
++    data_cfg = cfg["data"]
++    train_base, test_base, n_raw_classes = _load_base_datasets(data_cfg)
++    class_order = resolve_class_order(data_cfg, n_raw_classes, seed)
++    num_tasks = int(data_cfg["num_tasks"])
++    classes_per_task = int(data_cfg["classes_per_task"])
++    total_needed = num_tasks * classes_per_task
++    if total_needed > len(class_order):
++        raise ValueError(f"Need {total_needed} classes but class_order only has {len(class_order)}")
++    class_order = class_order[:total_needed]
++    raw_to_global = {raw: i for i, raw in enumerate(class_order)}
++
++    tasks: List[TaskData] = []
++    for task_id in range(num_tasks):
++        raw_classes = class_order[task_id * classes_per_task : (task_id + 1) * classes_per_task]
++        global_classes = [raw_to_global[c] for c in raw_classes]
++        train_set = RemapClassSubset(
++            train_base,
++            raw_classes,
++            raw_to_global,
++            max_per_class=data_cfg.get("max_train_per_class"),
++            seed=seed + task_id,
++        )
++        test_set = RemapClassSubset(
++            test_base,
++            raw_classes,
++            raw_to_global,
++            max_per_class=data_cfg.get("max_test_per_class"),
++            seed=seed + 1000 + task_id,
++        )
++        tasks.append(TaskData(task_id, raw_classes, global_classes, train_set, test_set))
++    return tasks, class_order, len(class_order)
++
++
++def build_pretrain_datasets(cfg: dict, seed: int):
++    data_cfg = cfg["data"]
++    train_base, test_base, n_raw_classes = _load_base_datasets(data_cfg)
++    class_order = resolve_class_order(data_cfg, n_raw_classes, seed)
++    raw_to_global = {raw: i for i, raw in enumerate(class_order)}
++    train_set = RemapClassSubset(
++        train_base,
++        class_order,
++        raw_to_global,
++        max_per_class=data_cfg.get("max_train_per_class"),
++        seed=seed,
++    )
++    test_set = RemapClassSubset(
++        test_base,
++        class_order,
++        raw_to_global,
++        max_per_class=data_cfg.get("max_test_per_class"),
++        seed=seed + 1,
++    )
++    return train_set, test_set, class_order
++
++
++def make_loader(dataset: Dataset, batch_size: int, shuffle: bool, num_workers: int) -> DataLoader:
++    return DataLoader(
++        dataset,
++        batch_size=batch_size,
++        shuffle=shuffle,
++        num_workers=num_workers,
++        pin_memory=torch.cuda.is_available(),
++        drop_last=False,
++    )
+diff --git a/src/ga_lora_sub/engine.py b/src/ga_lora_sub/engine.py
+new file mode 100644
+index 0000000..376878e
+--- /dev/null
++++ b/src/ga_lora_sub/engine.py
+@@ -0,0 +1,204 @@
++from __future__ import annotations
++
++from typing import Dict, Iterable, List, Optional, Sequence, Tuple
++
++import torch
++import torch.nn.functional as F
++from torch import nn
++from torch.cuda.amp import GradScaler, autocast
++from tqdm import tqdm
++
++from .models.lora import LoRALinear, iter_lora_modules
++
++
++def _make_local_targets(targets: torch.Tensor, current_classes: Sequence[int]) -> torch.Tensor:
++    mapping = {int(c): i for i, c in enumerate(current_classes)}
++    local = torch.empty_like(targets)
++    for cls, idx in mapping.items():
++        local[targets == cls] = idx
++    return local
++
++
++def train_one_task(
++    model: nn.Module,
++    loader,
++    current_classes: Sequence[int],
++    optimizer: torch.optim.Optimizer,
++    device: torch.device,
++    epochs: int,
++    amp: bool = False,
++) -> Dict[str, float]:
++    scaler = GradScaler(enabled=amp)
++    model.train()
++    last_loss = 0.0
++    for epoch in range(epochs):
++        pbar = tqdm(loader, desc=f"train epoch {epoch + 1}/{epochs}", leave=False)
++        running_loss = 0.0
++        seen = 0
++        for images, targets in pbar:
++            images = images.to(device, non_blocking=True)
++            targets = targets.to(device, non_blocking=True)
++            local_targets = _make_local_targets(targets, current_classes)
++
++            optimizer.zero_grad(set_to_none=True)
++            with autocast(enabled=amp):
++                logits = model(images)
++                logits_cur = logits[:, list(current_classes)]
++                loss = F.cross_entropy(logits_cur, local_targets)
++            scaler.scale(loss).backward()
++            scaler.step(optimizer)
++            scaler.update()
++
++            bs = images.size(0)
++            running_loss += float(loss.detach().cpu()) * bs
++            seen += bs
++            pbar.set_postfix(loss=running_loss / max(seen, 1))
++        last_loss = running_loss / max(seen, 1)
++    return {"loss": last_loss}
++
++
++@torch.no_grad()
++def extract_features(model: nn.Module, loader, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
++    model.eval()
++    feats = []
++    labels = []
++    for images, targets in loader:
++        images = images.to(device, non_blocking=True)
++        z = model.forward_features(images)
++        feats.append(z.detach().cpu())
++        labels.append(targets.detach().cpu())
++    return torch.cat(feats, dim=0), torch.cat(labels, dim=0)
++
++
++@torch.no_grad()
++def update_prototypes(
++    model: nn.Module,
++    loader,
++    device: torch.device,
++    prototypes: Dict[int, torch.Tensor],
++) -> Dict[int, torch.Tensor]:
++    feats, labels = extract_features(model, loader, device)
++    for c in labels.unique().tolist():
++        mask = labels == int(c)
++        prototypes[int(c)] = feats[mask].mean(dim=0)
++    return prototypes
++
++
++@torch.no_grad()
++def evaluate_linear(model: nn.Module, loader, device: torch.device) -> float:
++    model.eval()
++    correct = 0
++    total = 0
++    for images, targets in loader:
++        images = images.to(device, non_blocking=True)
++        targets = targets.to(device, non_blocking=True)
++        logits = model(images)
++        pred = logits.argmax(dim=1)
++        correct += int((pred == targets).sum().item())
++        total += int(targets.numel())
++    return correct / max(total, 1)
++
++
++@torch.no_grad()
++def evaluate_ncm(model: nn.Module, loader, device: torch.device, prototypes: Dict[int, torch.Tensor]) -> float:
++    model.eval()
++    if not prototypes:
++        return 0.0
++    classes = sorted(prototypes.keys())
++    proto = torch.stack([prototypes[c] for c in classes], dim=0).to(device)
++    proto = F.normalize(proto, dim=1)
++    correct = 0
++    total = 0
++    for images, targets in loader:
++        images = images.to(device, non_blocking=True)
++        targets = targets.to(device, non_blocking=True)
++        z = model.forward_features(images)
++        z = F.normalize(z, dim=1)
++        sim = z @ proto.t()
++        pred_idx = sim.argmax(dim=1)
++        pred = torch.tensor([classes[i] for i in pred_idx.tolist()], device=device, dtype=targets.dtype)
++        correct += int((pred == targets).sum().item())
++        total += int(targets.numel())
++    return correct / max(total, 1)
++
++
++def estimate_gradient_alignment(
++    model: nn.Module,
++    loader,
++    current_classes: Sequence[int],
++    old_deltas: Dict[str, torch.Tensor],
++    device: torch.device,
++    max_batches: int = 1,
++) -> Dict[str, float]:
++    """Estimate cos(-gradient, old_delta) for every LoRA-wrapped layer."""
++    if not old_deltas:
++        return {}
++    was_training = model.training
++    model.train()
++
++    lora_modules: Dict[str, LoRALinear] = {name: m for name, m in iter_lora_modules(model)}
++    for module in lora_modules.values():
++        module.weight.requires_grad_(True)
++        module.weight.grad = None
++
++    model.zero_grad(set_to_none=True)
++    batches = 0
++    for images, targets in loader:
++        images = images.to(device, non_blocking=True)
++        targets = targets.to(device, non_blocking=True)
++        local_targets = _make_local_targets(targets, current_classes)
++        logits = model(images)
++        logits_cur = logits[:, list(current_classes)]
++        loss = F.cross_entropy(logits_cur, local_targets) / max_batches
++        loss.backward()
++        batches += 1
++        if batches >= max_batches:
++            break
++
++    alignments: Dict[str, float] = {}
++    eps = 1e-12
++    for name, module in lora_modules.items():
++        old = old_deltas.get(name)
++        grad = module.weight.grad
++        if old is None or grad is None or old.abs().sum().item() == 0:
++            alignments[name] = 0.0
++            continue
++        update_dir = -grad.detach().flatten().float().cpu()
++        old_vec = old.detach().flatten().float().cpu()
++        denom = update_dir.norm() * old_vec.norm() + eps
++        alignments[name] = float(torch.dot(update_dir, old_vec) / denom)
++
++    for module in lora_modules.values():
++        module.weight.requires_grad_(False)
++        module.weight.grad = None
++    model.zero_grad(set_to_none=True)
++    model.train(was_training)
++    return alignments
++
++
++@torch.no_grad()
++def compute_feature_drift(
++    before: Dict[int, torch.Tensor],
++    after: Dict[int, torch.Tensor],
++) -> float:
++    common = sorted(set(before.keys()) & set(after.keys()))
++    if not common:
++        return 0.0
++    vals = []
++    for c in common:
++        vals.append(torch.norm(before[c] - after[c], p=2).item())
++    return float(sum(vals) / len(vals))
++
++
++@torch.no_grad()
++def class_centroids(model: nn.Module, loaders: List, device: torch.device) -> Dict[int, torch.Tensor]:
++    out: Dict[int, List[torch.Tensor]] = {}
++    for loader in loaders:
++        feats, labels = extract_features(model, loader, device)
++        for c in labels.unique().tolist():
++            out.setdefault(int(c), []).append(feats[labels == int(c)])
++    centroids = {}
++    for c, chunks in out.items():
++        all_feats = torch.cat(chunks, dim=0)
++        centroids[c] = all_feats.mean(dim=0)
++    return centroids
+diff --git a/src/ga_lora_sub/evaluate.py b/src/ga_lora_sub/evaluate.py
+new file mode 100644
+index 0000000..ae3212d
+--- /dev/null
++++ b/src/ga_lora_sub/evaluate.py
+@@ -0,0 +1,28 @@
++from __future__ import annotations
++
++import argparse
++from pathlib import Path
++
++import numpy as np
++import pandas as pd
++
++
++def parse_args():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--run-dir", required=True)
++    return parser.parse_args()
++
++
++def main():
++    args = parse_args()
++    run_dir = Path(args.run_dir)
++    metrics = pd.read_csv(run_dir / "metrics.csv")
++    acc = np.load(run_dir / "accuracy_matrix.npy")
++    print("最後一列 metrics：")
++    print(metrics.tail(1).to_string(index=False))
++    print("accuracy matrix：")
++    print(np.array2string(acc, precision=4, suppress_small=True))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/ga_lora_sub/methods.py b/src/ga_lora_sub/methods.py
+new file mode 100644
+index 0000000..1c1a9f7
+--- /dev/null
++++ b/src/ga_lora_sub/methods.py
+@@ -0,0 +1,29 @@
++from __future__ import annotations
++
++from typing import Dict
++
++import torch
++
++
++def compute_gammas(
++    method_cfg: dict,
++    alignments: Dict[str, float],
++    old_deltas: Dict[str, torch.Tensor],
++) -> Dict[str, float]:
++    method = str(method_cfg.get("name", "adaptive")).lower()
++    if method in {"none", "no_subtraction"}:
++        return {k: 0.0 for k in old_deltas.keys()}
++    if method in {"fixed", "fixed_subtraction"}:
++        return {k: 1.0 for k in old_deltas.keys()}
++    if method in {"adaptive", "gradient", "gradient_aware"}:
++        rho = float(method_cfg.get("rho", 0.5))
++        gmin = float(method_cfg.get("gamma_min", 0.5))
++        gmax = float(method_cfg.get("gamma_max", 1.5))
++        gammas = {}
++        for k in old_deltas.keys():
++            s = float(alignments.get(k, 0.0))
++            gamma = 1.0 - rho * s
++            gamma = max(gmin, min(gmax, gamma))
++            gammas[k] = float(gamma)
++        return gammas
++    raise ValueError(f"Unknown method.name: {method}")
+diff --git a/src/ga_lora_sub/metrics.py b/src/ga_lora_sub/metrics.py
+new file mode 100644
+index 0000000..269a233
+--- /dev/null
++++ b/src/ga_lora_sub/metrics.py
+@@ -0,0 +1,34 @@
++from __future__ import annotations
++
++from typing import Dict, List
++
++import numpy as np
++
++
++def average_accuracy(acc_matrix: np.ndarray, stage: int) -> float:
++    vals = acc_matrix[stage, : stage + 1]
++    vals = vals[~np.isnan(vals)]
++    return float(np.mean(vals)) if len(vals) else float("nan")
++
++
++def forgetting(acc_matrix: np.ndarray, stage: int) -> float:
++    if stage <= 0:
++        return 0.0
++    fs = []
++    for task_id in range(stage):
++        best = np.nanmax(acc_matrix[: stage + 1, task_id])
++        cur = acc_matrix[stage, task_id]
++        if not np.isnan(best) and not np.isnan(cur):
++            fs.append(best - cur)
++    return float(np.mean(fs)) if fs else 0.0
++
++
++def summarize_stage(acc_matrix: np.ndarray, stage: int, drift: float | None = None) -> Dict[str, float]:
++    out = {
++        "stage": int(stage),
++        "average_accuracy": average_accuracy(acc_matrix, stage),
++        "forgetting": forgetting(acc_matrix, stage),
++    }
++    if drift is not None:
++        out["feature_drift"] = float(drift)
++    return out
+diff --git a/src/ga_lora_sub/models/__init__.py b/src/ga_lora_sub/models/__init__.py
+new file mode 100644
+index 0000000..c472acf
+--- /dev/null
++++ b/src/ga_lora_sub/models/__init__.py
+@@ -0,0 +1,3 @@
++from .lora import LoRALinear
++
++__all__ = ["LoRALinear"]
+diff --git a/src/ga_lora_sub/models/lora.py b/src/ga_lora_sub/models/lora.py
+new file mode 100644
+index 0000000..352b53d
+--- /dev/null
++++ b/src/ga_lora_sub/models/lora.py
+@@ -0,0 +1,186 @@
++from __future__ import annotations
++
++import math
++from typing import Dict, Iterable, List, Tuple
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++
++
++class LoRALinear(nn.Module):
++    """A Linear layer with frozen base weight, optional subtraction delta, and trainable LoRA."""
++
++    def __init__(
++        self,
++        linear: nn.Linear,
++        rank: int = 8,
++        alpha: float = 16.0,
++        dropout: float = 0.0,
++    ) -> None:
++        super().__init__()
++        if rank <= 0:
++            raise ValueError("rank must be > 0")
++        self.in_features = linear.in_features
++        self.out_features = linear.out_features
++        self.rank = int(rank)
++        self.alpha = float(alpha)
++        self.scaling = self.alpha / self.rank
++
++        self.weight = nn.Parameter(linear.weight.detach().clone(), requires_grad=False)
++        if linear.bias is not None:
++            self.bias = nn.Parameter(linear.bias.detach().clone(), requires_grad=False)
++        else:
++            self.bias = None
++
++        self.lora_A = nn.Linear(self.in_features, self.rank, bias=False)
++        self.lora_B = nn.Linear(self.rank, self.out_features, bias=False)
++        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
++        self.register_buffer("sub_delta", torch.zeros_like(self.weight), persistent=True)
++        self.reset_lora_parameters()
++
++    def reset_lora_parameters(self) -> None:
++        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
++        nn.init.zeros_(self.lora_B.weight)
++
++    def zero_lora_parameters(self) -> None:
++        nn.init.zeros_(self.lora_A.weight)
++        nn.init.zeros_(self.lora_B.weight)
++
++    def get_delta_weight(self) -> torch.Tensor:
++        return (self.lora_B.weight @ self.lora_A.weight) * self.scaling
++
++    @torch.no_grad()
++    def set_sub_delta(self, delta: torch.Tensor | None) -> None:
++        if delta is None:
++            self.sub_delta.zero_()
++        else:
++            self.sub_delta.copy_(delta.to(device=self.sub_delta.device, dtype=self.sub_delta.dtype))
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        base = F.linear(x, self.weight + self.sub_delta, self.bias)
++        lora = self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
++        return base + lora
++
++
++def _get_parent_module(model: nn.Module, module_name: str) -> Tuple[nn.Module, str]:
++    parts = module_name.split(".")
++    parent = model
++    for p in parts[:-1]:
++        parent = getattr(parent, p)
++    return parent, parts[-1]
++
++
++def add_lora_to_model(
++    model: nn.Module,
++    target_modules: Iterable[str],
++    rank: int,
++    alpha: float,
++    dropout: float,
++) -> List[str]:
++    """Replace selected nn.Linear modules by LoRALinear.
++
++    `target_modules` are substring patterns matched against full module names.
++    Example for timm ViT: ["attn.qkv"] or ["attn.qkv", "attn.proj"].
++    """
++    patterns = list(target_modules)
++    replaced: List[str] = []
++    named = list(model.named_modules())
++    for name, module in named:
++        if not isinstance(module, nn.Linear):
++            continue
++        if not any(pat in name for pat in patterns):
++            continue
++        parent, child_name = _get_parent_module(model, name)
++        setattr(parent, child_name, LoRALinear(module, rank=rank, alpha=alpha, dropout=dropout))
++        replaced.append(name)
++    if not replaced:
++        raise RuntimeError(f"No nn.Linear modules matched target_modules={patterns}")
++    return replaced
++
++
++def iter_lora_modules(model: nn.Module):
++    for name, module in model.named_modules():
++        if isinstance(module, LoRALinear):
++            yield name, module
++
++
++def freeze_non_lora(model: nn.Module, train_head: bool = True) -> None:
++    for name, p in model.named_parameters():
++        p.requires_grad_(False)
++    for _, module in iter_lora_modules(model):
++        module.lora_A.weight.requires_grad_(True)
++        module.lora_B.weight.requires_grad_(True)
++    if train_head and hasattr(model, "head"):
++        for p in model.head.parameters():
++            p.requires_grad_(True)
++
++
++def reset_lora_parameters(model: nn.Module) -> None:
++    for _, module in iter_lora_modules(model):
++        module.reset_lora_parameters()
++
++
++def zero_lora_parameters(model: nn.Module) -> None:
++    for _, module in iter_lora_modules(model):
++        module.zero_lora_parameters()
++
++
++@torch.no_grad()
++def collect_lora_deltas(model: nn.Module, device: torch.device | str = "cpu") -> Dict[str, torch.Tensor]:
++    return {name: module.get_delta_weight().detach().to(device) for name, module in iter_lora_modules(model)}
++
++
++@torch.no_grad()
++def empty_lora_deltas(model: nn.Module, device: torch.device | str = "cpu") -> Dict[str, torch.Tensor]:
++    return {name: torch.zeros_like(module.weight, device=device) for name, module in iter_lora_modules(model)}
++
++
++@torch.no_grad()
++def add_delta_dict(a: Dict[str, torch.Tensor], b: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
++    out = {}
++    keys = set(a.keys()) | set(b.keys())
++    for k in keys:
++        if k in a and k in b:
++            out[k] = a[k].detach().cpu() + b[k].detach().cpu()
++        elif k in a:
++            out[k] = a[k].detach().cpu().clone()
++        else:
++            out[k] = b[k].detach().cpu().clone()
++    return out
++
++
++@torch.no_grad()
++def scale_delta_dict(a: Dict[str, torch.Tensor], scales: Dict[str, float] | float) -> Dict[str, torch.Tensor]:
++    out = {}
++    for k, v in a.items():
++        s = scales if isinstance(scales, (float, int)) else scales.get(k, 1.0)
++        out[k] = v.detach().cpu() * float(s)
++    return out
++
++
++@torch.no_grad()
++def set_subtraction_deltas(model: nn.Module, deltas: Dict[str, torch.Tensor], sign: float = 1.0) -> None:
++    for name, module in iter_lora_modules(model):
++        delta = deltas.get(name)
++        if delta is None:
++            module.set_sub_delta(None)
++        else:
++            module.set_sub_delta(delta.to(module.weight.device) * float(sign))
++
++
++@torch.no_grad()
++def clear_subtraction_deltas(model: nn.Module) -> None:
++    for _, module in iter_lora_modules(model):
++        module.set_sub_delta(None)
++
++
++def lora_state_dict_cpu(model: nn.Module) -> Dict[str, Dict[str, torch.Tensor]]:
++    state = {}
++    for name, module in iter_lora_modules(model):
++        state[name] = {
++            "A": module.lora_A.weight.detach().cpu().clone(),
++            "B": module.lora_B.weight.detach().cpu().clone(),
++            "sub_delta": module.sub_delta.detach().cpu().clone(),
++        }
++    return state
+diff --git a/src/ga_lora_sub/models/timm_backbone.py b/src/ga_lora_sub/models/timm_backbone.py
+new file mode 100644
+index 0000000..6412771
+--- /dev/null
++++ b/src/ga_lora_sub/models/timm_backbone.py
+@@ -0,0 +1,60 @@
++from __future__ import annotations
++
++from typing import Optional
++
++import torch
++import torch.nn as nn
++import timm
++
++
++class TimmClassifier(nn.Module):
++    def __init__(self, model_name: str, num_classes: int, pretrained: bool = True, allow_random_fallback: bool = True):
++        super().__init__()
++        try:
++            self.backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
++        except Exception as exc:
++            if pretrained and allow_random_fallback:
++                print(f"[warning] failed to load pretrained weights: {exc}")
++                print("[warning] fallback to random initialization. For real experiments, provide a checkpoint or internet access.")
++                self.backbone = timm.create_model(model_name, pretrained=False, num_classes=0)
++            else:
++                raise
++        self.num_features = int(getattr(self.backbone, "num_features"))
++        self.head = nn.Linear(self.num_features, num_classes)
++
++    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
++        return self.backbone(x)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        z = self.forward_features(x)
++        return self.head(z)
++
++
++def load_backbone_checkpoint(model: TimmClassifier, checkpoint_path: Optional[str]) -> None:
++    if checkpoint_path in {None, "", "null"}:
++        return
++    ckpt = torch.load(checkpoint_path, map_location="cpu")
++    if isinstance(ckpt, dict) and "backbone_state_dict" in ckpt:
++        state = ckpt["backbone_state_dict"]
++    elif isinstance(ckpt, dict) and "model_state_dict" in ckpt:
++        state = {k.replace("backbone.", ""): v for k, v in ckpt["model_state_dict"].items() if k.startswith("backbone.")}
++    else:
++        state = ckpt
++    missing, unexpected = model.backbone.load_state_dict(state, strict=False)
++    print(f"[checkpoint] loaded backbone from {checkpoint_path}")
++    if missing:
++        print(f"[checkpoint] missing keys: {len(missing)}")
++    if unexpected:
++        print(f"[checkpoint] unexpected keys: {len(unexpected)}")
++
++
++def build_model(cfg: dict, num_classes: int) -> TimmClassifier:
++    model_cfg = cfg["model"]
++    model = TimmClassifier(
++        model_name=model_cfg["name"],
++        num_classes=num_classes,
++        pretrained=bool(model_cfg.get("pretrained", True)),
++        allow_random_fallback=bool(model_cfg.get("allow_random_fallback", True)),
++    )
++    load_backbone_checkpoint(model, model_cfg.get("checkpoint"))
++    return model
+diff --git a/src/ga_lora_sub/pretrain.py b/src/ga_lora_sub/pretrain.py
+new file mode 100644
+index 0000000..4052330
+--- /dev/null
++++ b/src/ga_lora_sub/pretrain.py
+@@ -0,0 +1,113 @@
++from __future__ import annotations
++
++import argparse
++from pathlib import Path
++
++import pandas as pd
++import torch
++import torch.nn.functional as F
++from torch.cuda.amp import GradScaler, autocast
++from tqdm import tqdm
++
++from .data import build_pretrain_datasets, make_loader
++from .models.timm_backbone import TimmClassifier
++from .utils import apply_overrides, count_trainable_parameters, ensure_dir, load_yaml, save_yaml, set_seed
++
++
++def parse_args():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--config", required=True)
++    parser.add_argument("--work-dir", required=True)
++    parser.add_argument("--set", nargs="*", default=None)
++    return parser.parse_args()
++
++
++@torch.no_grad()
++def evaluate(model, loader, device):
++    model.eval()
++    correct = 0
++    total = 0
++    for images, targets in loader:
++        images = images.to(device, non_blocking=True)
++        targets = targets.to(device, non_blocking=True)
++        pred = model(images).argmax(dim=1)
++        correct += int((pred == targets).sum())
++        total += int(targets.numel())
++    return correct / max(total, 1)
++
++
++def main():
++    args = parse_args()
++    cfg = apply_overrides(load_yaml(args.config), args.set)
++    seed = int(cfg.get("seed", 42))
++    set_seed(seed)
++    work_dir = ensure_dir(args.work_dir)
++    save_yaml(cfg, work_dir / "config_resolved.yaml")
++
++    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++    train_set, test_set, class_order = build_pretrain_datasets(cfg, seed=seed)
++    num_classes = len(class_order)
++    batch_size = int(cfg["training"].get("batch_size", 64))
++    num_workers = int(cfg["data"].get("num_workers", 4))
++    train_loader = make_loader(train_set, batch_size, True, num_workers)
++    test_loader = make_loader(test_set, batch_size, False, num_workers)
++
++    model = TimmClassifier(
++        model_name=cfg["model"]["name"],
++        num_classes=num_classes,
++        pretrained=bool(cfg["model"].get("pretrained", False)),
++        allow_random_fallback=bool(cfg["model"].get("allow_random_fallback", True)),
++    ).to(device)
++    print(f"[pretrain] classes={num_classes}, trainable={count_trainable_parameters(model):,}")
++
++    optimizer = torch.optim.AdamW(
++        model.parameters(),
++        lr=float(cfg["training"].get("lr", 1e-3)),
++        weight_decay=float(cfg["training"].get("weight_decay", 0.05)),
++    )
++    epochs = int(cfg["training"].get("epochs", 50))
++    amp = bool(cfg["training"].get("amp", False)) and torch.cuda.is_available()
++    scaler = GradScaler(enabled=amp)
++    records = []
++    best_acc = -1.0
++
++    for epoch in range(epochs):
++        model.train()
++        total_loss = 0.0
++        total = 0
++        pbar = tqdm(train_loader, desc=f"pretrain epoch {epoch+1}/{epochs}")
++        for images, targets in pbar:
++            images = images.to(device, non_blocking=True)
++            targets = targets.to(device, non_blocking=True)
++            optimizer.zero_grad(set_to_none=True)
++            with autocast(enabled=amp):
++                loss = F.cross_entropy(model(images), targets)
++            scaler.scale(loss).backward()
++            scaler.step(optimizer)
++            scaler.update()
++            bs = images.size(0)
++            total_loss += float(loss.detach().cpu()) * bs
++            total += bs
++            pbar.set_postfix(loss=total_loss / max(total, 1))
++        acc = evaluate(model, test_loader, device)
++        rec = {"epoch": epoch + 1, "loss": total_loss / max(total, 1), "val_acc": acc}
++        records.append(rec)
++        pd.DataFrame(records).to_csv(work_dir / "pretrain_metrics.csv", index=False)
++        print(f"[pretrain] epoch={epoch+1} val_acc={acc:.4f}")
++        if acc > best_acc:
++            best_acc = acc
++            torch.save(
++                {
++                    "config": cfg,
++                    "class_order": class_order,
++                    "backbone_state_dict": model.backbone.state_dict(),
++                    "head_state_dict": model.head.state_dict(),
++                    "val_acc": best_acc,
++                },
++                work_dir / "backbone.pt",
++            )
++    print(f"[pretrain done] best_acc={best_acc:.4f}, checkpoint={work_dir / 'backbone.pt'}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/ga_lora_sub/train_cil.py b/src/ga_lora_sub/train_cil.py
+new file mode 100644
+index 0000000..c4067d2
+--- /dev/null
++++ b/src/ga_lora_sub/train_cil.py
+@@ -0,0 +1,182 @@
++from __future__ import annotations
++
++import argparse
++from pathlib import Path
++from typing import Dict, List
++
++import numpy as np
++import pandas as pd
++import torch
++from torch import nn
++
++from .data import build_cil_tasks, make_loader
++from .engine import (
++    class_centroids,
++    compute_feature_drift,
++    estimate_gradient_alignment,
++    evaluate_linear,
++    evaluate_ncm,
++    train_one_task,
++    update_prototypes,
++)
++from .methods import compute_gammas
++from .metrics import summarize_stage
++from .models.lora import (
++    add_delta_dict,
++    add_lora_to_model,
++    clear_subtraction_deltas,
++    collect_lora_deltas,
++    empty_lora_deltas,
++    freeze_non_lora,
++    reset_lora_parameters,
++    scale_delta_dict,
++    set_subtraction_deltas,
++)
++from .models.timm_backbone import build_model
++from .utils import apply_overrides, count_trainable_parameters, ensure_dir, load_yaml, save_json, save_yaml, set_seed
++
++
++def parse_args():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--config", required=True)
++    parser.add_argument("--work-dir", required=True)
++    parser.add_argument("--set", nargs="*", default=None, help="Override config values, e.g. method.name=fixed training.epochs=1")
++    return parser.parse_args()
++
++
++def main() -> None:
++    args = parse_args()
++    cfg = apply_overrides(load_yaml(args.config), args.set)
++    seed = int(cfg.get("seed", 42))
++    set_seed(seed)
++    work_dir = ensure_dir(args.work_dir)
++    save_yaml(cfg, work_dir / "config_resolved.yaml")
++
++    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++    tasks, class_order, num_classes = build_cil_tasks(cfg, seed=seed)
++
++    model = build_model(cfg, num_classes=num_classes)
++    lora_cfg = cfg["model"]["lora"]
++    replaced = add_lora_to_model(
++        model,
++        target_modules=lora_cfg.get("target_modules", ["attn.qkv"]),
++        rank=int(lora_cfg.get("rank", 8)),
++        alpha=float(lora_cfg.get("alpha", 16)),
++        dropout=float(lora_cfg.get("dropout", 0.0)),
++    )
++    print(f"[lora] inserted into {len(replaced)} modules")
++    for name in replaced[:10]:
++        print(f"  - {name}")
++    if len(replaced) > 10:
++        print("  ...")
++
++    model.to(device)
++    freeze_non_lora(model, train_head=bool(cfg["training"].get("train_head", True)))
++    print(f"[params] trainable parameters: {count_trainable_parameters(model):,}")
++
++    batch_size = int(cfg["training"].get("batch_size", 64))
++    num_workers = int(cfg["data"].get("num_workers", 4))
++    epochs = int(cfg["training"].get("epochs", 10))
++    amp = bool(cfg["training"].get("amp", False)) and torch.cuda.is_available()
++    eval_classifier = str(cfg.get("evaluation", {}).get("classifier", "ncm")).lower()
++
++    train_loaders = [make_loader(t.train_set, batch_size, True, num_workers) for t in tasks]
++    eval_train_loaders = [make_loader(t.train_set, batch_size, False, num_workers) for t in tasks]
++    test_loaders = [make_loader(t.test_set, batch_size, False, num_workers) for t in tasks]
++
++    old_deltas: Dict[str, torch.Tensor] = empty_lora_deltas(model, device="cpu")
++    prototypes: Dict[int, torch.Tensor] = {}
++    acc_matrix = np.full((len(tasks), len(tasks)), np.nan, dtype=np.float32)
++    records: List[dict] = []
++    previous_centroids: Dict[int, torch.Tensor] = {}
++
++    for task_idx, task in enumerate(tasks):
++        print(f"\n[task {task_idx + 1}/{len(tasks)}] raw_classes={task.raw_classes}")
++        reset_lora_parameters(model)
++        clear_subtraction_deltas(model)
++
++        # Estimate gamma with no subtraction first.
++        alignments = estimate_gradient_alignment(
++            model,
++            train_loaders[task_idx],
++            current_classes=task.global_classes,
++            old_deltas=old_deltas,
++            device=device,
++            max_batches=int(cfg["method"].get("grad_batches", 1)),
++        )
++        gammas = compute_gammas(cfg["method"], alignments, old_deltas)
++        save_json({"alignments": alignments, "gammas": gammas}, work_dir / f"gammas_task_{task_idx + 1}.json")
++
++        # Train in drift-resistant space: W0 - gamma * old_delta + current LoRA.
++        subtraction = scale_delta_dict(old_deltas, gammas)
++        set_subtraction_deltas(model, subtraction, sign=-1.0)
++
++        optimizer = torch.optim.AdamW(
++            [p for p in model.parameters() if p.requires_grad],
++            lr=float(cfg["training"].get("lr", 5e-4)),
++            weight_decay=float(cfg["training"].get("weight_decay", 1e-4)),
++        )
++        train_stats = train_one_task(
++            model,
++            train_loaders[task_idx],
++            current_classes=task.global_classes,
++            optimizer=optimizer,
++            device=device,
++            epochs=epochs,
++            amp=amp,
++        )
++
++        # Merge current LoRA into cumulative delta bank, then evaluate with W0 + cumulative LoRA.
++        current_delta = collect_lora_deltas(model, device="cpu")
++        old_deltas = add_delta_dict(old_deltas, current_delta)
++        reset_lora_parameters(model)
++        set_subtraction_deltas(model, old_deltas, sign=1.0)
++
++        # Update prototypes only for current task. Old prototypes are kept rehearsal-free.
++        prototypes = update_prototypes(model, eval_train_loaders[task_idx], device, prototypes)
++
++        # Feature drift is measured on old task test data for analysis only.
++        current_centroids = class_centroids(model, test_loaders[: task_idx + 1], device)
++        drift = compute_feature_drift(previous_centroids, current_centroids) if task_idx > 0 else 0.0
++        previous_centroids = current_centroids
++
++        for eval_task_idx in range(task_idx + 1):
++            if eval_classifier == "linear":
++                acc = evaluate_linear(model, test_loaders[eval_task_idx], device)
++            elif eval_classifier == "ncm":
++                acc = evaluate_ncm(model, test_loaders[eval_task_idx], device, prototypes)
++            else:
++                raise ValueError(f"Unknown evaluation.classifier: {eval_classifier}")
++            acc_matrix[task_idx, eval_task_idx] = acc
++            print(f"  eval task {eval_task_idx + 1}: acc={acc:.4f}")
++
++        rec = summarize_stage(acc_matrix, task_idx, drift=drift)
++        rec.update({
++            "train_loss": train_stats["loss"],
++            "method": cfg["method"]["name"],
++            "num_seen_classes": (task_idx + 1) * int(cfg["data"]["classes_per_task"]),
++        })
++        records.append(rec)
++        pd.DataFrame(records).to_csv(work_dir / "metrics.csv", index=False)
++        np.save(work_dir / "accuracy_matrix.npy", acc_matrix)
++        print(f"  average_accuracy={rec['average_accuracy']:.4f}, forgetting={rec['forgetting']:.4f}, drift={drift:.4f}")
++
++        torch.save(
++            {
++                "config": cfg,
++                "class_order": class_order,
++                "task_idx": task_idx,
++                "model_state_dict": model.state_dict(),
++                "old_deltas": old_deltas,
++                "prototypes": prototypes,
++                "acc_matrix": acc_matrix,
++            },
++            work_dir / "checkpoint_last.pt",
++        )
++
++    print("\n[done]")
++    print(pd.DataFrame(records).tail(1).to_string(index=False))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/ga_lora_sub/utils.py b/src/ga_lora_sub/utils.py
+new file mode 100644
+index 0000000..a4c91a3
+--- /dev/null
++++ b/src/ga_lora_sub/utils.py
+@@ -0,0 +1,93 @@
++from __future__ import annotations
++
++import json
++import os
++import random
++from copy import deepcopy
++from pathlib import Path
++from typing import Any, Dict, Iterable, List
++
++import numpy as np
++import torch
++import yaml
++
++
++def set_seed(seed: int) -> None:
++    random.seed(seed)
++    np.random.seed(seed)
++    torch.manual_seed(seed)
++    torch.cuda.manual_seed_all(seed)
++    torch.backends.cudnn.benchmark = True
++
++
++def load_yaml(path: str | os.PathLike) -> Dict[str, Any]:
++    with open(path, "r", encoding="utf-8") as f:
++        return yaml.safe_load(f)
++
++
++def save_yaml(obj: Dict[str, Any], path: str | os.PathLike) -> None:
++    Path(path).parent.mkdir(parents=True, exist_ok=True)
++    with open(path, "w", encoding="utf-8") as f:
++        yaml.safe_dump(obj, f, allow_unicode=True, sort_keys=False)
++
++
++def save_json(obj: Dict[str, Any], path: str | os.PathLike) -> None:
++    Path(path).parent.mkdir(parents=True, exist_ok=True)
++    with open(path, "w", encoding="utf-8") as f:
++        json.dump(obj, f, ensure_ascii=False, indent=2)
++
++
++def parse_value(raw: str) -> Any:
++    low = raw.lower()
++    if low in {"true", "false"}:
++        return low == "true"
++    if low in {"none", "null"}:
++        return None
++    try:
++        if "." in raw:
++            return float(raw)
++        return int(raw)
++    except ValueError:
++        return raw
++
++
++def set_by_dot(config: Dict[str, Any], dotted_key: str, value: Any) -> None:
++    cur = config
++    parts = dotted_key.split(".")
++    for p in parts[:-1]:
++        if p not in cur or cur[p] is None:
++            cur[p] = {}
++        cur = cur[p]
++    cur[parts[-1]] = value
++
++
++def apply_overrides(config: Dict[str, Any], overrides: Iterable[str] | None) -> Dict[str, Any]:
++    cfg = deepcopy(config)
++    if not overrides:
++        return cfg
++    for item in overrides:
++        if "=" not in item:
++            raise ValueError(f"Override must be KEY=VALUE, got: {item}")
++        k, v = item.split("=", 1)
++        set_by_dot(cfg, k, parse_value(v))
++    return cfg
++
++
++def count_trainable_parameters(model: torch.nn.Module) -> int:
++    return sum(p.numel() for p in model.parameters() if p.requires_grad)
++
++
++def to_device(batch: Any, device: torch.device) -> Any:
++    if isinstance(batch, torch.Tensor):
++        return batch.to(device, non_blocking=True)
++    if isinstance(batch, (list, tuple)):
++        return type(batch)(to_device(x, device) for x in batch)
++    if isinstance(batch, dict):
++        return {k: to_device(v, device) for k, v in batch.items()}
++    return batch
++
++
++def ensure_dir(path: str | os.PathLike) -> Path:
++    p = Path(path)
++    p.mkdir(parents=True, exist_ok=True)
++    return p
+diff --git a/tests/test_lora.py b/tests/test_lora.py
+new file mode 100644
+index 0000000..5df39c3
+--- /dev/null
++++ b/tests/test_lora.py
+@@ -0,0 +1,26 @@
++import torch
++import torch.nn as nn
++
++from ga_lora_sub.models.lora import LoRALinear
++
++
++def test_lora_linear_initially_matches_base():
++    torch.manual_seed(0)
++    linear = nn.Linear(5, 3)
++    lora = LoRALinear(linear, rank=2, alpha=4)
++    x = torch.randn(7, 5)
++    y0 = linear(x)
++    y1 = lora(x)
++    assert torch.allclose(y0, y1, atol=1e-6)
++
++
++def test_sub_delta_changes_output():
++    torch.manual_seed(0)
++    linear = nn.Linear(5, 3)
++    lora = LoRALinear(linear, rank=2, alpha=4)
++    x = torch.randn(7, 5)
++    delta = torch.ones_like(lora.weight) * 0.01
++    lora.set_sub_delta(delta)
++    y = lora(x)
++    assert y.shape == (7, 3)
++    assert not torch.allclose(y, linear(x))
